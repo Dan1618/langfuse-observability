@@ -1,0 +1,192 @@
+import { Annotation, Command, END, interrupt, MemorySaver, START, StateGraph } from '@langchain/langgraph';
+import { ChatOpenAI } from '@langchain/openai';
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Company, SummaryState } from 'interfaces/state.interface';
+import { CallbackHandler } from '@langfuse/langchain';
+import { z } from "zod";
+import * as fs from 'fs';
+import * as path from 'path';
+
+
+const RiskSchema = z.object({
+  riskScore: z.number().min(1).max(5).describe("The general risk profile score from 1 to 5"),
+});
+
+
+const StateAnnotation = Annotation.Root({
+  companies: Annotation<Company[]>(),
+  draft: Annotation<string | undefined>(),
+  portfolioOverview: Annotation<string | undefined>(),
+});
+
+
+@Injectable()
+export class GraphService {
+  private readonly appGraph;
+
+  constructor(private configService: ConfigService) {
+
+    const llm = new ChatOpenAI({
+      model: 'gpt-4o-mini',
+      apiKey: this.configService.get<string>('OPENAI_API_KEY'),
+    });
+
+    const scoreCompanies = async (state: typeof StateAnnotation.State) => {
+      // Map your companies into an array of promises to run them in parallel
+      const updatedCompanies = await Promise.all(
+        state.companies.map(async (company) => {
+          if (!company.risk) {
+            // 2. Bind the schema to the LLM so it ONLY returns the JSON structure
+            const structuredLlm = llm.withStructuredOutput(RiskSchema);
+
+            const response = await structuredLlm.invoke([
+              {
+                role: "system",
+                content: "You are a risk assessment AI. Analyze the company and provide a risk score from 1 to 5. (where 1 is low risk)"
+              },
+              { role: "user", content: JSON.stringify(company) },
+            ]);
+
+            // response is now typed as { riskScore: number }
+            return {
+              ...company,
+              risk: response.riskScore,
+            };
+          }
+
+          return company
+
+        })
+      );
+
+      return { companies: updatedCompanies };
+    };
+
+    const humanReview = async (state: typeof StateAnnotation.State) => {
+      const approvedCompanies: Company[] = [];
+
+      for (const company of state.companies) {
+        // Pause execution and send the company to the user for review.
+        // The return value is whatever the user sends back via Command({ resume: ... }).
+        const decision = interrupt({
+          company,
+          message: `Please approve or reject: ${company.name} (${company.ticker})`,
+        });
+
+        if (decision?.approve) {
+          // If the user provided a risk override, apply it
+          const finalCompany = (decision.risk != null)
+            ? { ...company, risk: decision.risk }
+            : company;
+          approvedCompanies.push(finalCompany);
+        }
+        // If not approved, the company is simply not added (i.e. removed from state).
+      }
+
+      return { companies: approvedCompanies };
+    };
+
+    const generateOverview = async (state: typeof StateAnnotation.State) => {
+      if (!state.companies || state.companies.length === 0) {
+        return { portfolioOverview: 'No companies were approved — nothing to summarize.' };
+      }
+
+      const companySummaries = state.companies
+        .map(c => `${c.name} (${c.ticker}) — Risk: ${c.risk ?? 'N/A'}`)
+        .join('\n');
+
+      const response = await llm.invoke([
+        {
+          role: 'system',
+          content:
+            'You are a financial analyst. Given the list of approved portfolio companies below, ' +
+            'write a concise portfolio overview (3-5 sentences). Highlight overall risk profile, ' +
+            'sector diversity, and any notable observations.',
+        },
+        { role: 'user', content: companySummaries },
+      ]);
+
+      return { portfolioOverview: response.content as string };
+    };
+
+    const workflow = new StateGraph(StateAnnotation)
+      .addNode("scoreCompanies", scoreCompanies)
+      .addNode("humanReview", humanReview)
+      .addNode("generateOverview", generateOverview)
+      .addEdge(START, "scoreCompanies")
+      .addEdge("scoreCompanies", "humanReview")
+      .addEdge("humanReview", "generateOverview")
+      .addEdge("generateOverview", END);
+
+    // https://docs.langchain.com/oss/javascript/langgraph/persistence
+    const memory = new MemorySaver();
+    this.appGraph = workflow.compile({ checkpointer: memory });
+
+
+  }
+
+  private readonly threadConfig = { configurable: { thread_id: "1" } };
+
+  async start() {
+    const inputData = this.getInputCompanies();
+
+    const initialState: SummaryState = {
+      companies: inputData
+    };
+
+    // Each invocation gets its own handler so the trace is correctly scoped.
+    const langfuseHandler = new CallbackHandler({
+      tags: ['langgraph', 'portfolio-review'],
+    });
+
+    // Invoke the graph — it will pause at the first interrupt in humanReview
+    const result = await this.appGraph.invoke(initialState, {
+      ...this.threadConfig,
+      callbacks: [langfuseHandler],
+    });
+
+    console.log('Graph paused or completed.');
+    return result;
+  }
+
+  /**
+   * Reads input companies from the JSON file.
+   */
+  getInputCompanies(): Company[] {
+    const inputPath = path.join(process.cwd(), 'data', 'inputCompanies.json');
+    return JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+  }
+
+  /**
+   * Get the current graph state including any pending interrupts.
+   */
+  async getState() {
+    const state = await this.appGraph.getState(this.threadConfig);
+    return state;
+  }
+
+  /**
+   * Resume the graph after an interrupt with the user's decision.
+   * @param approve - whether the user approves the current company
+   */
+  async resume(approve: boolean, risk?: number) {
+    const resumePayload: { approve: boolean; risk?: number } = { approve };
+    if (risk != null) {
+      resumePayload.risk = risk;
+    }
+
+    const langfuseHandler = new CallbackHandler({
+      tags: ['langgraph', 'portfolio-review'],
+    });
+
+    const result = await this.appGraph.invoke(
+      new Command({ resume: resumePayload }),
+      {
+        ...this.threadConfig,
+        callbacks: [langfuseHandler],
+      },
+    );
+    return result;
+  }
+}
