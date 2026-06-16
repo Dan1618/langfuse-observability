@@ -1,6 +1,7 @@
 ## Description
 
-Building AI Agent with LangGraph and NestJS
+Repo based on that one https://github.com/Dan1618/nest-langgraph
+it additionally connects to langfuse
 
 ## Project setup
 
